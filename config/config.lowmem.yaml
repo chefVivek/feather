@@ -1,0 +1,96 @@
+# Hermes config overlay — 8 GB laptop acting as a 24x7 host, cost-optimised.
+#
+# This is NOT a drop-in replacement for ~/.hermes/config.yaml. Hermes owns that
+# file (it carries a managed `_config_version` used for migrations). Merge these
+# sections into it, or apply them one at a time:
+#
+#     hermes config set model.default z-ai/glm-5.2
+#     hermes config set provider_routing.sort price
+#
+# Verify every model id against your own account before relying on it:
+#
+#     hermes model          # interactive picker, fetches the live catalog
+#
+# Model ids below were taken from the Hermes model catalog on 2026-10-23.
+# The catalog is a live manifest and ids rotate — treat them as a starting
+# point, not gospel.
+
+# =============================================================================
+# Model: three tiers, cheapest default
+# =============================================================================
+# The cost rule that matters: ~90% of an agent's calls are routing, summarising,
+# planning and tool-result digestion, where a cheap model is indistinguishable.
+# The remaining ~10% is hard reasoning and code, where a frontier model earns
+# its price. Paying frontier rates for all of it is the single biggest avoidable
+# cost in a setup like this.
+#
+# Tier 1 (default, bulk work) — z-ai/glm-5.2
+#   Hermes' own silent default. Deliberately chosen as capable-but-cheap.
+# Tier 2 (fallback / mid) — moonshotai/kimi-k3
+#   Stronger on long context and tool use; costs more.
+# Tier 3 (hard coding) — switch per task, do not set as default:
+#   /model anthropic/claude-opus-4.7      (in chat)
+#   hermes model                          (persistent change)
+model:
+  default: "z-ai/glm-5.2"
+
+  # "auto" detects from whichever keys are present in ~/.hermes/.env.
+  # Pin to "openrouter" so one key reaches every model and provider_routing
+  # below actually applies (it is ignored on Nous Portal and direct providers).
+  provider: "openrouter"
+
+# =============================================================================
+# Provider routing — only applies when provider is openrouter
+# =============================================================================
+provider_routing:
+  # Cheapest provider first for any given model.
+  sort: "price"
+
+  # Refuse providers that silently drop request parameters. Without this a
+  # cheap endpoint can quietly ignore tool definitions, which looks like the
+  # agent "forgetting" it has tools rather than like an error.
+  require_parameters: true
+
+  # Opt out of providers that train on request data.
+  data_collection: "deny"
+
+  # ignore: []   # add provider slugs you want never used
+  # only: []     # or whitelist explicitly
+
+# =============================================================================
+# Fallbacks — keep working when the primary is rate-limited or down
+# =============================================================================
+# Tried in order. Each entry needs both provider and model.
+fallback_providers:
+  - provider: openrouter
+    model: "moonshotai/kimi-k3"
+  - provider: openrouter
+    model: "openai/gpt-5.4"
+
+fallback:
+  # A primary that says it resets within 2 minutes is worth waiting for rather
+  # than failing over — avoids flapping onto a pricier model for a short blip.
+  min_switch_reset_seconds: 120
+
+# =============================================================================
+# Low-memory host tuning
+# =============================================================================
+database:
+  # WAL is correct on ext4/btrfs on a local SSD. Switch to "delete" only if the
+  # profile lives on NFS/SMB or a virtiofs bind mount from macOS.
+  journal_mode: "wal"
+  # Cap the WAL so it cannot grow unbounded on a small disk (64 MiB).
+  journal_size_limit: 67108864
+  wal_autocheckpoint: 1000
+
+runtime:
+  # Default is 4096. An 8 GB host running the gateway plus a browser does not
+  # need more, and a lower ceiling surfaces descriptor leaks early.
+  nofile_soft_limit: 4096
+
+plugins:
+  # Slow home connections time out on large plugin repos at the 300 s default.
+  clone_timeout_seconds: 600
+
+attachments:
+  storage: "hermes-home"
