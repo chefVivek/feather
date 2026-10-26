@@ -142,7 +142,7 @@ else
     fi
     if dpkg -s systemd-zram-generator >/dev/null 2>&1; then
       write_file "$ZRAM_CONF" "zram sized to half of RAM, max 4G" <<'EOF'
-# Managed by atlas setup-host.sh
+# Managed by feather setup-host.sh
 [zram0]
 zram-size = min(ram / 2, 4096)
 compression-algorithm = zstd
@@ -159,7 +159,7 @@ say "Memory tunables"
 # With zram, swapping to compressed RAM is cheap, so a high swappiness is
 # correct — the kernel default of 60 is tuned for disk swap.
 write_file "$SYSCTL_FILE" "swappiness + cache pressure for a zram host" <<'EOF'
-# Managed by atlas setup-host.sh
+# Managed by feather setup-host.sh
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
 vm.dirty_background_ratio = 5
@@ -172,7 +172,7 @@ ok "vm.swappiness=100, vfs_cache_pressure=50"
 say "Lid behaviour"
 if [ -d /proc/acpi/button/lid ] && [ -n "$(ls -A /proc/acpi/button/lid 2>/dev/null)" ]; then
   write_file "$LOGIND_DROPIN" "ignore lid events" <<'EOF'
-# Managed by atlas setup-host.sh
+# Managed by feather setup-host.sh
 # A laptop acting as a server must keep running with the lid shut.
 [Login]
 HandleLidSwitch=ignore
@@ -200,7 +200,7 @@ else
     run "set charge limit to ${BATTERY_PCT}%" sh -c "echo $BATTERY_PCT > '$bat_thr'"
     # The sysfs value resets on reboot, so persist it as a unit.
     write_file "$BATTERY_UNIT" "re-apply charge limit at boot" <<EOF
-# Managed by atlas setup-host.sh
+# Managed by feather setup-host.sh
 [Unit]
 Description=Cap battery charge at ${BATTERY_PCT}% for 24x7 AC operation
 After=multi-user.target
