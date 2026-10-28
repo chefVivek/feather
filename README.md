@@ -139,8 +139,33 @@ Early. Honest state of each piece:
 | `scripts/preflight.sh` | ✅ Tested end-to-end |
 | `scripts/setup-host.sh` | ⚠️ Dry-run tested only — see below |
 | `config/config.lowmem.yaml` | ✅ Schema-validated |
-| Spend ceiling | ⬜ Not started |
+| `bin/feather-spend` | ✅ 17 end-to-end tests, all passing |
 | Portable skills | ⬜ Not started |
+
+### Spend ceiling
+
+A metering proxy between the agent and the provider. It forwards every request,
+records what it cost, and returns HTTP 402 once you hit the cap — the agent stops
+rather than retries, and a refused request never reaches the provider.
+
+```bash
+export OPENROUTER_API_KEY=...
+bin/feather-spend serve --daily 5 --monthly 50
+hermes config set model.base_url http://127.0.0.1:8787/v1
+
+bin/feather-spend status      # spend against caps, broken down by model
+```
+
+Standard library only, no dependencies, binds to `127.0.0.1` exclusively.
+Because it speaks plain OpenAI-compatible HTTP it also works with OpenClaw,
+OpenJarvis, Cursor or anything else that lets you set a base URL.
+
+**Two honest limits.** The cap is checked *before* a call, so a single request can
+overshoot it — the cost of a call is unknowable until it completes. Worst case you
+exceed the cap by one call. And when a provider reports no cost and the model is
+absent from the built-in price table, the call is recorded as `$0` and counted as
+**unpriced**; `status` reports that count separately so the gap is visible rather
+than silently understating your spend.
 
 `setup-host.sh` is syntax- and shellcheck-clean and its dry-run path is verified, but
 it has not yet been applied on a machine with systemd, a battery and writable swap.

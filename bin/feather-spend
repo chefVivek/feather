@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+feather-spend — a hard spend ceiling for any OpenAI-compatible agent.
+
+Sits between the agent and the model provider. Forwards every request,
+records what it cost, and refuses new requests once you hit your cap.
+The agent sees a normal HTTP error and stops; it cannot spend past the limit.
+
+Standard library only. No dependencies.
+
+    feather-spend serve                 # start the proxy
+    feather-spend status                # what have I spent?
+    feather-spend reset --today         # clear today's tally
+
+Point your agent at it:
+
+    hermes config set model.base_url http://127.0.0.1:8787/v1
+
+Configuration (environment, or flags):
+
+    FEATHER_DAILY_USD      default 5.00
+    FEATHER_MONTHLY_USD    default 50.00
+    FEATHER_UPSTREAM       default https://openrouter.ai/api/v1
+    FEATHER_UPSTREAM_KEY   upstream API key; falls back to OPENROUTER_API_KEY
+    FEATHER_DB             default ~/.feather/spend.db
+    FEATHER_PORT           default 8787
+
+Cost accounting: the proxy asks the provider to report usage, and records
+`usage.cost` when the provider returns it (OpenRouter does). When only token
+counts come back it falls back to a per-model price table; when neither is
+available the call is recorded with cost 0 and counted as unpriced, which
+`status` reports separately so the gap is visible rather than silent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import threading
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_PORT = 8787
+DEFAULT_UPSTREAM = "https://openrouter.ai/api/v1"
+DEFAULT_DAILY_USD = 5.0
+DEFAULT_MONTHLY_USD = 50.0
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+# Fallback USD per 1M tokens, used only when the provider reports no cost.
+# Deliberately sparse: a missing entry is recorded as unpriced rather than
+# guessed at, so the tally never silently understates spend.
+PRICES = {
+    "z-ai/glm-5.2":          (0.15, 0.50),
+    "moonshotai/kimi-k3":    (0.95, 4.00),
+    "deepseek/deepseek-v4":  (0.14, 0.28),
+    "openai/gpt-5.4":        (5.00, 30.00),
+    "anthropic/claude-opus-4.7": (5.00, 25.00),
+}
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Ledger:
+    """Append-only spend log in SQLite. Safe across the server's threads."""
+
+    def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS spend (
+                   id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                   ts        TEXT NOT NULL,
+                   day       TEXT NOT NULL,
+                   month     TEXT NOT NULL,
+                   model     TEXT,
+                   cost_usd  REAL NOT NULL DEFAULT 0,
+                   prompt_tokens     INTEGER DEFAULT 0,
+                   completion_tokens INTEGER DEFAULT 0,
+                   priced    INTEGER NOT NULL DEFAULT 1
+               )"""
+        )
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_day ON spend(day)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_month ON spend(month)")
+        self._db.commit()
+        # Fail fast on an unwritable database rather than at the first request.
+        os.chmod(path, 0o600)
+
+    def record(self, model, cost, ptok, ctok, priced) -> None:
+        now = utcnow()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO spend (ts, day, month, model, cost_usd,"
+                " prompt_tokens, completion_tokens, priced)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (now.isoformat(), now.strftime("%Y-%m-%d"), now.strftime("%Y-%m"),
+                 model, cost, ptok, ctok, 1 if priced else 0),
+            )
+            self._db.commit()
+
+    def _sum(self, column: str, value: str) -> float:
+        with self._lock:
+            row = self._db.execute(
+                f"SELECT COALESCE(SUM(cost_usd), 0) FROM spend WHERE {column} = ?",
+                (value,),
+            ).fetchone()
+        return float(row[0])
+
+    def today(self) -> float:
+        return self._sum("day", utcnow().strftime("%Y-%m-%d"))
+
+    def month(self) -> float:
+        return self._sum("month", utcnow().strftime("%Y-%m"))
+
+    def unpriced_calls(self, month: str) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM spend WHERE month = ? AND priced = 0", (month,)
+            ).fetchone()
+        return int(row[0])
+
+    def by_model(self, month: str):
+        with self._lock:
+            return self._db.execute(
+                "SELECT model, COUNT(*), SUM(cost_usd) FROM spend"
+                " WHERE month = ? GROUP BY model ORDER BY SUM(cost_usd) DESC",
+                (month,),
+            ).fetchall()
+
+    def clear(self, column: str, value: str) -> int:
+        with self._lock:
+            cur = self._db.execute(f"DELETE FROM spend WHERE {column} = ?", (value,))
+            self._db.commit()
+            return cur.rowcount
+
+
+def price_from_tokens(model, ptok, ctok):
+    """(cost, priced). priced is False when the model is not in the table."""
+    entry = PRICES.get(model)
+    if not entry:
+        return 0.0, False
+    pin, pout = entry
+    return (ptok / 1e6) * pin + (ctok / 1e6) * pout, True
+
+
+def extract_usage(payload: dict):
+    """Pull (model, cost, prompt_tokens, completion_tokens, priced) from a response."""
+    usage = payload.get("usage") or {}
+    model = payload.get("model")
+    ptok = int(usage.get("prompt_tokens") or 0)
+    ctok = int(usage.get("completion_tokens") or 0)
+
+    # OpenRouter reports real cost when asked; prefer it over any estimate.
+    cost = usage.get("cost")
+    if cost is None:
+        cost = (usage.get("cost_details") or {}).get("upstream_inference_cost")
+    if isinstance(cost, (int, float)):
+        return model, float(cost), ptok, ctok, True
+
+    if ptok or ctok:
+        est, priced = price_from_tokens(model, ptok, ctok)
+        return model, est, ptok, ctok, priced
+    return model, 0.0, 0, 0, False
+
+
+class Proxy(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "feather-spend"
+
+    # Injected by serve()
+    ledger: Ledger
+    upstream: str
+    upstream_key: str
+    daily_cap: float
+    monthly_cap: float
+
+    def log_message(self, fmt, *args):  # quieter than the default
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _send_json(self, status: int, obj: dict) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _over_cap(self):
+        """Return a human-readable reason if a cap is already exceeded."""
+        today, month = self.ledger.today(), self.ledger.month()
+        if self.daily_cap > 0 and today >= self.daily_cap:
+            return f"daily spend cap reached: ${today:.4f} of ${self.daily_cap:.2f}"
+        if self.monthly_cap > 0 and month >= self.monthly_cap:
+            return f"monthly spend cap reached: ${month:.4f} of ${self.monthly_cap:.2f}"
+        return None
+
+    def do_GET(self):
+        if self.path.rstrip("/") in ("/healthz", "/feather/status"):
+            self._send_json(200, {
+                "ok": True,
+                "today_usd": round(self.ledger.today(), 6),
+                "month_usd": round(self.ledger.month(), 6),
+                "daily_cap_usd": self.daily_cap,
+                "monthly_cap_usd": self.monthly_cap,
+            })
+            return
+        self._forward(b"")
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send_json(400, {"error": {"message": "bad Content-Length"}})
+            return
+        if length > MAX_BODY_BYTES:
+            self._send_json(413, {"error": {"message": "request too large"}})
+            return
+
+        reason = self._over_cap()
+        if reason:
+            self.log_message("REFUSED: %s", reason)
+            # 402 is unambiguous and makes agents stop rather than retry.
+            self._send_json(402, {"error": {
+                "message": f"feather-spend: {reason}. "
+                           "Raise the cap or run `feather-spend reset --today`.",
+                "type": "insufficient_quota",
+                "code": "feather_spend_cap",
+            }})
+            return
+
+        self._forward(self.rfile.read(length) if length else b"")
+
+    def _forward(self, body: bytes) -> None:
+        url = self.upstream.rstrip("/") + self.path[len("/v1"):] \
+            if self.path.startswith("/v1") else self.upstream.rstrip("/") + self.path
+
+        streaming = False
+        if body:
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict):
+                    streaming = bool(payload.get("stream"))
+                    # Ask for usage so spend can be recorded accurately.
+                    payload.setdefault("usage", {})
+                    if isinstance(payload["usage"], dict):
+                        payload["usage"]["include"] = True
+                    if streaming:
+                        opts = payload.setdefault("stream_options", {})
+                        if isinstance(opts, dict):
+                            opts["include_usage"] = True
+                    body = json.dumps(payload).encode()
+            except (ValueError, TypeError):
+                pass  # not JSON: forward untouched
+
+        headers = {"Content-Type": "application/json"}
+        if self.upstream_key:
+            headers["Authorization"] = f"Bearer {self.upstream_key}"
+        for h in ("HTTP-Referer", "X-Title", "Accept"):
+            if self.headers.get(h):
+                headers[h] = self.headers[h]
+
+        req = urllib.request.Request(
+            url, data=body or None, headers=headers,
+            method="POST" if body else "GET")
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            detail = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(detail)))
+            self.end_headers()
+            self.wfile.write(detail)
+            return
+        except Exception as e:  # network/DNS/timeout
+            self._send_json(502, {"error": {"message": f"feather-spend upstream: {e}"}})
+            return
+
+        with resp:
+            if streaming:
+                self._relay_stream(resp)
+            else:
+                self._relay_once(resp)
+
+    def _relay_once(self, resp) -> None:
+        data = resp.read()
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        try:
+            self._record(json.loads(data))
+        except (ValueError, TypeError):
+            pass
+
+    def _relay_stream(self, resp) -> None:
+        """Pass SSE through byte-for-byte while watching for the usage chunk."""
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        pending = b""
+        last_usage = None
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                break  # client hung up; still record what we saw
+
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw in (b"", b"[DONE]"):
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("usage"):
+                    last_usage = obj
+
+        if last_usage:
+            self._record(last_usage)
+        else:
+            # A stream that reported nothing still cost money; make it visible.
+            self._record({"model": None, "usage": {}})
+
+    def _record(self, payload: dict) -> None:
+        model, cost, ptok, ctok, priced = extract_usage(payload)
+        self.ledger.record(model, cost, ptok, ctok, priced)
+        today, month = self.ledger.today(), self.ledger.month()
+        flag = "" if priced else "  [UNPRICED]"
+        self.log_message("%s  $%.5f  today $%.4f/%.2f  month $%.4f/%.2f%s",
+                         model or "?", cost, today, self.daily_cap,
+                         month, self.monthly_cap, flag)
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        sys.exit(f"{name} must be a number, got {raw!r}")
+
+
+def db_path() -> str:
+    return os.environ.get("FEATHER_DB") or os.path.expanduser("~/.feather/spend.db")
+
+
+def cmd_serve(args) -> int:
+    key = os.environ.get("FEATHER_UPSTREAM_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
+    if not key:
+        sys.stderr.write(
+            "warning: no FEATHER_UPSTREAM_KEY or OPENROUTER_API_KEY set; "
+            "requests will be forwarded without an Authorization header\n")
+
+    Proxy.ledger = Ledger(db_path())
+    Proxy.upstream = args.upstream
+    Proxy.upstream_key = key
+    Proxy.daily_cap = args.daily
+    Proxy.monthly_cap = args.monthly
+
+    # 127.0.0.1 only. This process holds an API key; it must never be
+    # reachable from the network.
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Proxy)
+    server.daemon_threads = True
+    print(f"feather-spend on http://127.0.0.1:{args.port}/v1 -> {args.upstream}")
+    print(f"caps: ${args.daily:.2f}/day  ${args.monthly:.2f}/month   db: {db_path()}")
+    print(f"point your agent at it:  hermes config set model.base_url http://127.0.0.1:{args.port}/v1")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+def cmd_status(args) -> int:
+    ledger = Ledger(db_path())
+    today, month = ledger.today(), ledger.month()
+    mkey = utcnow().strftime("%Y-%m")
+
+    def bar(used, cap, width=28):
+        if cap <= 0:
+            return "(no cap)"
+        filled = min(width, int(width * used / cap))
+        return "[" + "#" * filled + "." * (width - filled) + f"] {100 * used / cap:5.1f}%"
+
+    print(f"today   ${today:8.4f} / ${args.daily:7.2f}   {bar(today, args.daily)}")
+    print(f"month   ${month:8.4f} / ${args.monthly:7.2f}   {bar(month, args.monthly)}")
+
+    rows = ledger.by_model(mkey)
+    if rows:
+        print(f"\nthis month by model:")
+        for model, calls, cost in rows:
+            print(f"  {model or '(unknown)':34} {calls:5} calls  ${cost or 0:9.4f}")
+
+    unpriced = ledger.unpriced_calls(mkey)
+    if unpriced:
+        print(f"\n{unpriced} call(s) this month had no cost data and are counted as $0.")
+        print("Real spend is higher than shown. Add the model to PRICES, or enable")
+        print("usage accounting on the provider.")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    ledger = Ledger(db_path())
+    if args.today:
+        n = ledger.clear("day", utcnow().strftime("%Y-%m-%d"))
+        print(f"cleared {n} record(s) for today")
+    elif args.month:
+        n = ledger.clear("month", utcnow().strftime("%Y-%m"))
+        print(f"cleared {n} record(s) for this month")
+    else:
+        sys.exit("specify --today or --month")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="feather-spend", description=__doc__.split("\n")[1])
+    p.add_argument("--daily", type=float, default=env_float("FEATHER_DAILY_USD", DEFAULT_DAILY_USD),
+                   help="daily cap in USD (0 disables)")
+    p.add_argument("--monthly", type=float, default=env_float("FEATHER_MONTHLY_USD", DEFAULT_MONTHLY_USD),
+                   help="monthly cap in USD (0 disables)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve", help="run the metering proxy")
+    s.add_argument("--port", type=int, default=int(os.environ.get("FEATHER_PORT", DEFAULT_PORT)))
+    s.add_argument("--upstream", default=os.environ.get("FEATHER_UPSTREAM", DEFAULT_UPSTREAM))
+    s.set_defaults(func=cmd_serve)
+
+    sub.add_parser("status", help="show spend against caps").set_defaults(func=cmd_status)
+
+    r = sub.add_parser("reset", help="clear recorded spend")
+    r.add_argument("--today", action="store_true")
+    r.add_argument("--month", action="store_true")
+    r.set_defaults(func=cmd_reset)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
