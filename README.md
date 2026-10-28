@@ -93,12 +93,28 @@ Measured footprint with the low-memory profile:
 | Active, one browser | ~2.5 GB |
 | Peak, while a build agent runs | ~5–6 GB |
 
-Three conditions make that possible, and `preflight.sh` enforces all three:
+Two conditions make that possible, and `preflight.sh` enforces both:
 
-- **Linux bare-metal, not Windows + WSL2.** On 8 GB, Windows alone takes half the machine.
 - **SQLite only.** No Postgres anywhere.
 - **Swap and zram configured.** Without swap, an 8 GB host is OOM-killed during build
   bursts rather than merely running slowly.
+
+### Platform support
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Hermes itself | ✅ Tier 1 | ✅ Tier 1 | ✅ Tier 1 (native — no WSL, no Docker) |
+| `bin/feather-spend` | ✅ | ✅ | ✅ |
+| `scripts/preflight.sh` · `setup-host.sh` | ✅ | ⬜ Not ported | ⬜ Not ported |
+
+feather's host-hardening scripts are Debian/Ubuntu-specific today: systemd, apt,
+and Linux sysfs have no direct equivalent elsewhere. The spend ceiling is pure
+standard-library Python and runs everywhere.
+
+On Windows, Hermes installs natively and auto-starts with `hermes gateway install`
+(Scheduled Tasks, no admin). Two caveats for an always-on host: the task runs at
+**logon**, not boot, so the machine has to be logged in; and Windows Update reboots
+on its own schedule. Neither is fatal, but a Linux box is steadier for 24×7.
 
 ## What this is not
 
@@ -158,7 +174,9 @@ bin/feather-spend status      # spend against caps, broken down by model
 
 Standard library only, no dependencies, binds to `127.0.0.1` exclusively.
 Because it speaks plain OpenAI-compatible HTTP it also works with OpenClaw,
-OpenJarvis, Cursor or anything else that lets you set a base URL.
+OpenJarvis, Cursor or anything else that lets you set a base URL — and it runs
+on **Linux, macOS and Windows** unchanged. On Windows the ledger's `0600` mode is
+a no-op, since `chmod` there only toggles the read-only bit.
 
 **Two honest limits.** The cap is checked *before* a call, so a single request can
 overshoot it — the cost of a call is unknowable until it completes. Worst case you

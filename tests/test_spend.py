@@ -209,9 +209,14 @@ def main():
         check("requests resume after reset", status == 200, f"got {status}")
 
         print("\nhardening")
-        check("database is owner-only (0600)",
-              oct(os.stat(db).st_mode & 0o777) == "0o600",
-              oct(os.stat(db).st_mode & 0o777))
+        if os.name == "posix":
+            check("database is owner-only (0600)",
+                  oct(os.stat(db).st_mode & 0o777) == "0o600",
+                  oct(os.stat(db).st_mode & 0o777))
+        else:
+            # chmod on Windows only toggles the read-only bit, so POSIX mode
+            # bits are not a meaningful assertion there.
+            print("  SKIP  database permissions (POSIX-only check)")
     finally:
         proc.terminate()
         try:
