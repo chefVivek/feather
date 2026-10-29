@@ -4,14 +4,15 @@
 # file (it carries a managed `_config_version` used for migrations). Merge these
 # sections into it, or apply them one at a time:
 #
-#     hermes config set model.default z-ai/glm-5.2
+#     hermes config set model.default deepseek/deepseek-v4.1-flash
 #     hermes config set provider_routing.sort price
 #
 # Verify every model id against your own account before relying on it:
 #
 #     hermes model          # interactive picker, fetches the live catalog
 #
-# Model ids below were taken from the Hermes model catalog on 2026-10-23.
+# Model ids and prices below were taken from the Hermes model picker
+# (live OpenRouter pricing) on 2026-10-29.
 # The catalog is a live manifest and ids rotate — treat them as a starting
 # point, not gospel.
 
@@ -24,15 +25,27 @@
 # its price. Paying frontier rates for all of it is the single biggest avoidable
 # cost in a setup like this.
 #
-# Tier 1 (default, bulk work) — z-ai/glm-5.2
-#   Hermes' own silent default. Deliberately chosen as capable-but-cheap.
-# Tier 2 (fallback / mid) — moonshotai/kimi-k3
-#   Stronger on long context and tool use; costs more.
-# Tier 3 (hard coding) — switch per task, do not set as default:
-#   /model anthropic/claude-opus-4.7      (in chat)
-#   hermes model                          (persistent change)
+# Agent cost is dominated by INPUT, not output: every step resends the whole
+# context (brief, tool list, history) and gets a short reply back. Rank models
+# by input and cache-read price first. A model with cheap input but $5+ output
+# is still fine; a model with $10 input is not, however good it is.
+#
+# Tier 1 (default, bulk work) — deepseek/deepseek-v4.1-flash
+#   $0.04 in / $0.50 out / $0.006 cache-read per 1M. ~$0.013 per typical task.
+# Fallbacks (same price tier, different providers, for resilience):
+#   anthropic/claude-haiku-5.5   $0.10 / $0.50 / $0.01
+#   openai/gpt-6-luna            $0.10 / $0.50 / $0.01
+# If the default fumbles tool calls, promote one of these to default.
+#
+# Tier 3 (hard reasoning and code) — switch per task, never set as default:
+#   /model anthropic/claude-sonnet-5.5    $2 / $10
+#   /model anthropic/claude-opus-5.5      $4 / $20
+#
+# Avoid as default: anything at $10 input (fable, gpt-6-astra) costs ~100x the
+# default per task; kimi-k3 ($20 out) and glm-5.2 ($5.40 out) are poor value
+# for an agent despite cheap input.
 model:
-  default: "z-ai/glm-5.2"
+  default: "deepseek/deepseek-v4.1-flash"
 
   # "auto" detects from whichever keys are present in ~/.hermes/.env.
   # Pin to "openrouter" so one key reaches every model and provider_routing
@@ -63,9 +76,9 @@ provider_routing:
 # Tried in order. Each entry needs both provider and model.
 fallback_providers:
   - provider: openrouter
-    model: "moonshotai/kimi-k3"
+    model: "anthropic/claude-haiku-5.5"
   - provider: openrouter
-    model: "openai/gpt-5.4"
+    model: "openai/gpt-6-luna"
 
 fallback:
   # A primary that says it resets within 2 minutes is worth waiting for rather

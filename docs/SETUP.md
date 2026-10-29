@@ -51,7 +51,7 @@ you escalate per-task for hard work:
 
 ```powershell
 hermes config set model.provider openrouter
-hermes config set model.default z-ai/glm-5.2
+hermes config set model.default deepseek/deepseek-v4.1-flash
 hermes config set provider_routing.sort price
 ```
 
