@@ -54,32 +54,37 @@ feather is the layer Hermes deliberately leaves to the operator:
 | **A spend ceiling** | a hard cap on API spend. Upstream has billing internals but no user-facing limit — on a metered key, that is real exposure |
 | **Cost-tiered routing** | cheap model for the ~90% of calls that are routing and summarising, frontier model only for hard reasoning |
 | **A security posture you can audit** | file permissions, localhost binding, egress policy, sandboxed execution — checked, not assumed |
-| **Portable skills** | written to the [agentskills.io](https://agentskills.io) standard, so they also load in OpenClaw and OpenJarvis |
+| **A standing brief, not a skill library** | one `SOUL.md` that tells the agent who you are, what it may do unsupervised, and when to stop. It attempts the work; its own curator writes skills from what actually succeeded |
 
 ## Install
 
-```bash
-git clone https://github.com/<you>/feather && cd feather
+Full walkthrough, Windows and Linux: **[docs/SETUP.md](docs/SETUP.md)**. About 20 minutes.
 
-bash scripts/preflight.sh            # read-only. Will this machine hold it?
-sudo bash scripts/setup-host.sh --dry-run   # see every change first
-sudo bash scripts/setup-host.sh             # apply, with confirmation
-bash scripts/preflight.sh            # confirm the warnings cleared
+The short version on Windows (native, no WSL, no Docker):
+
+```powershell
+git clone https://github.com/chefVivek/feather; cd feather
+iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1)
+hermes setup
+copy bootstrap\SOUL.template.md $env:LOCALAPPDATA\hermes\SOUL.md   # then fill it in
+python bin\feather-spend serve --daily 5 --monthly 50
+hermes config set model.base_url http://127.0.0.1:8787/v1
+hermes gateway setup; hermes gateway install
 ```
 
-Then install the agent itself and apply the tuned config:
+On Linux, run `scripts/preflight.sh` and `scripts/setup-host.sh` first — they
+prepare a low-RAM box for genuine 24×7 operation. `preflight.sh` changes nothing
+and is always safe; `setup-host.sh` is idempotent, supports `--dry-run`, and asks
+before touching anything.
 
-```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-source ~/.bashrc && hermes setup
+## Don't teach it — use it
 
-hermes config set model.provider openrouter
-hermes config set model.default z-ai/glm-5.2
-hermes config set provider_routing.sort price
-```
-
-`preflight.sh` changes nothing and is safe to run first, always.
-`setup-host.sh` is idempotent, supports `--dry-run`, and asks before touching anything.
+The tempting move is to pre-write a skill for every task you imagine. Don't.
+A frontier model already knows how to write a CV or a scraper; what it lacks is
+context about you and clear limits. `bootstrap/SOUL.template.md` supplies those
+once. Then give it real work, let Hermes' curator turn successful runs into
+skills, and intervene only where it fails repeatedly. A skill earned from a real
+run beats one written from imagination.
 
 ## Hardware
 
@@ -156,7 +161,8 @@ Early. Honest state of each piece:
 | `scripts/setup-host.sh` | ⚠️ Dry-run tested only — see below |
 | `config/config.lowmem.yaml` | ✅ Schema-validated |
 | `bin/feather-spend` | ✅ 17 end-to-end tests, all passing |
-| Portable skills | ⬜ Not started |
+| `bootstrap/SOUL.template.md` | ✅ Written — standing brief, installs to `HERMES_HOME` |
+| `docs/SETUP.md` | ✅ Windows-native and Linux paths |
 
 ### Spend ceiling
 
@@ -204,9 +210,9 @@ Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by
 [Nous Research](https://nousresearch.com) (MIT). feather only configures and extends it;
 all the hard agent engineering is theirs.
 
-Skills follow the [agentskills.io](https://agentskills.io) standard, shared with
-Hermes, [OpenClaw](https://github.com/openclaw/openclaw) and
-[OpenJarvis](https://github.com/open-jarvis/openjarvis).
+Skills the agent writes for itself follow the [agentskills.io](https://agentskills.io)
+standard, shared with [OpenClaw](https://github.com/openclaw/openclaw) and
+[OpenJarvis](https://github.com/open-jarvis/openjarvis), so they stay portable.
 
 ## License
 
